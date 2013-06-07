@@ -1,44 +1,57 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, Rank2Types #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 module Board
-  ( PieceSize (..), Player (..), Column (..), Pos, BoardProper, ReserveArray, Board (..)
+  ( PieceSize (..), Player (..), Column (..), Pos
+  , BoardProper, ReserveArray, Board (..)
+  , FrozenBoardProper, FrozenReserveArray, FrozenBoard (..)
   , BoardM (), newBoard, readBoardProper, writeBoardProper, readReserveArray, writeReserveArray
   , fullBounds, fullRange, saveBoard, mainBoard
-  , runBoardMOnNew
+  , runBoardMOnNew, runBoardMOnCopy, freezeBoard, thawBoard, freezeBoardM
   ) where
 import System.Exit
 
-import Data.Array.IO
+import Data.Array.IO hiding (unsafeFreeze)
 import Data.Array
+import Data.Array.Unsafe (unsafeFreeze)
 
 import Control.Monad
 import Control.Monad.Reader
-import Control.Monad.IO
-import Control.Monad.Maybe
+import Control.Monad.Maybe ()
+import Test.QuickCheck
+import Test.Agata
+import Prelude.SafeEnum
 
-data PieceSize = S | MS | ML | L
+data PieceSize = S | MS | ML | L ; $( agatath $ derive ''PieceSize)
     deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
 
-data Player = Black | White
+data Player = Black | White; $( agatath $ derive ''Player)
     deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
 
-data Column = C0 | C1 | C2 | C3
+data Column = C0 | C1 | C2 | C3; $( agatath $ derive ''Player
     deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
-data Row = R0 | R1 | R2 | R3
+data Row = R0 | R1 | R2 | R3; $( agatath $ derive ''Player
     deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
 
 type Pos = (Column, Row)
 
 type BoardProper = IOArray (Pos, PieceSize) (Maybe Player)
+type FrozenBoardProper = Array (Pos, PieceSize) (Maybe Player)
 
-data PileID = P0 | P1 | P2
+data PileID = P0 | P1 | P2; $( agatath $ derive ''Player
     deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
 
 type ReserveArray = IOArray (Player, PileID) (Maybe PieceSize)
+type FrozenReserveArray = Array (Player, PileID) (Maybe PieceSize)
 
-type Board
-    {boardProper :: BoardProper, reserveArray :: ReserveArray}
+data Board = Board
+    { boardProper :: BoardProper
+    , reserveArray :: ReserveArray
+    }
+data FrozenBoard = FrozenBoard
+    { frozenBoardProper :: FrozenBoardProper
+    , frozenReserveArray :: FrozenReserveArray
+    }
 
-newtype BoardM a = BoardM (ReaderT (Board) (IO) a)
+newtype BoardM a = BoardM (ReaderT (Board) IO a)
     deriving (Monad, Functor)
 
 mkBoard :: IO (BoardProper) -> IO (ReserveArray) -> IO (Board)
@@ -50,18 +63,20 @@ newBoard = mkBoard (makeMaxArray Nothing) (makeMaxArray (Just L))
    makeMaxArray :: (Ix x, Bounded x) => e -> IO (IOArray x e)
    makeMaxArray fillValue = newArray fullBounds fillValue
 
-runBoardMOnNew :: BoardM a -> 
+runBoardMOnNew :: BoardM a -> IO a
+runBoardMOnNew m = runBoardM m =<< newBoard 
 
 runBoardM :: BoardM a -> Board -> IO a
 runBoardM (BoardM m) arr = runReaderT m arr
 
-cloneArray = thaw . unsafeFreeze
+clone :: forall ix e. (Ix ix) => IOArray ix e -> IO (IOArray ix e)
+clone a = thaw =<< (unsafeFreeze a :: IO (Array ix e))
 
 runBoardMOnCopy :: BoardM a -> Board -> IO a
 runBoardMOnCopy m arr =
   do
-  boardProperClone <- clone =<< boardProper arr
-  reservesClone <- clone =<< reserveArray arr
+  boardProperClone <- clone (boardProper arr)
+  reservesClone <- clone (reserveArray arr)
   runBoardM m (Board boardProperClone reservesClone)
 
 readArrayBM :: (Ix ix) => (Board -> IOArray ix e) -> ix -> BoardM e
@@ -99,11 +114,6 @@ saveArray getArray toChar =
       forM fullRange 
       (\ ix -> toChar `liftM` readArray arr ix)
 
---a zip that fails if the two lists are differnt in length
-exactZip :: [a] -> [b] -> Maybe [(a,b)]
-exactZip [] [] = return []
-exactZip (x:xs) (y:ys) = ((x,y) :) `fmap` exactZip xs ys
-
 saveProperBoard :: BoardM String
 saveProperBoard = saveArray boardProper toChar
     where
@@ -125,5 +135,63 @@ saveReserveArray = saveArray reserveArray toChar
 saveBoard :: BoardM String
 saveBoard = liftM2 (++) saveProperBoard saveReserveArray 
 
+freezeBoardM :: BoardM FrozenBoard
+freezeBoardM = BoardM $
+  do
+  b <- ask
+  lift (freezeBoard b)  
+
+freezeBoard :: Board -> IO FrozenBoard
+freezeBoard (Board a b) = liftM2 FrozenBoard (freeze a) (freeze b)
+
+thawBoard :: FrozenBoard -> IO Board
+thawBoard (FrozenBoard a b) = liftM2 Board (thaw a) (thaw b)
+
 mainBoard :: IO ExitCode
 mainBoard = return ExitSuccess
+
+data Move = Move {source :: Either PileID Pos, destination :: Pos} 
+
+doMove :: Player -> Move -> EitherT MoveError BoardM ()
+doMove player move@(Move source destination) = 
+  do
+  movingPiece <- fmapLT (ReadSorceError move) (readSource player source)
+  targetTop <- lift $ topPiece destination
+  (maxSize, isFromReserves) <-
+    case source of
+      Left _ -> Nothing
+      Right _ -> pred movingPiece
+  if targetTop > maxSize)
+    then throwError $
+      if isFromReserves then MovesFromReservesCantGoble move targetTop else TargetToBigToGoble move maxSize targetTop
+    else return ()
+  writeProperBoard (Pos, movingPiece) (Just player)
+  case source of
+    Left pile -> writeReservesArray (Player, pile) (pred movingPiece)
+    Right sourcePos -> lift $ removeTop sourcePos
+  return ()
+
+data MoveError = ReadSourceError Move ReadSorceError 
+  | MovesFromReservesCantGoble Move (Maybe PieceSize) 
+  | TargetTooBigToGoble (Maybe PieceSize) (Maybe PieceSize)
+  deriving (Show)
+
+data ReadSourceError = EmptySquare | EmptyPile | WrongColor
+
+readSource :: Player -> Either PileID Pos -> EitherT ReadSourceError BoardM ()
+readSource player source =
+  case source of
+    Left pile -> noteAndHoist EmptyPile =<< (lift readReserveArray (player, pile))))
+    Right source -> do
+                    (player', size) <- hoistEither EmptySquare =<< lift (readTopSquare pos)
+                    if player' != player
+                      then throwT WrongColor
+                      else return $ size
+
+  where
+  noteAndHoist :: Monad m => e -> Maybe a -> EitherT e m a
+  noteAndHoist err = hoistEither . note err               
+
+readTopSquare = undefined
+
+
