@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables, TemplateHaskell #-}
 module Board
   ( PieceSize (..), Player (..), Column (..), Pos
   , BoardProper, ReserveArray, Board (..)
@@ -20,24 +20,31 @@ import Test.QuickCheck
 import Test.Agata
 import Prelude.SafeEnum
 
-data PieceSize = S | MS | ML | L ; $( agatath $ derive ''PieceSize)
+data PieceSize = S | MS | ML | L  
     deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
+$( agatath $ derive ''PieceSize)
 
-data Player = Black | White; $( agatath $ derive ''Player)
+data Player = Black | White 
     deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
+$( agatath $ derive ''Player)
 
-data Column = C0 | C1 | C2 | C3; $( agatath $ derive ''Player
+data Column = C0 | C1 | C2 | C3
     deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
-data Row = R0 | R1 | R2 | R3; $( agatath $ derive ''Player
+data Row = R0 | R1 | R2 | R3
     deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
+
+$( agatath $ derive ''Column)
+$( agatath $ derive ''Row)
+
 
 type Pos = (Column, Row)
 
 type BoardProper = IOArray (Pos, PieceSize) (Maybe Player)
 type FrozenBoardProper = Array (Pos, PieceSize) (Maybe Player)
 
-data PileID = P0 | P1 | P2; $( agatath $ derive ''Player
+data PileID = P0 | P1 | P2
     deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
+$( agatath $ derive ''Player)
 
 type ReserveArray = IOArray (Player, PileID) (Maybe PieceSize)
 type FrozenReserveArray = Array (Player, PileID) (Maybe PieceSize)
