@@ -1,5 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables, TemplateHaskell #-}
-module Board
+module Game.Goblet.Board
   ( PieceSize (..), Player (..), Column (..), Pos
   , BoardProper, ReserveArray, Board (..)
   , FrozenBoardProper, FrozenReserveArray, FrozenBoard (..)
