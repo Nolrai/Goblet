@@ -20,11 +20,11 @@ import Test.QuickCheck
 import Test.Agata
 import Prelude.SafeEnum
 
-data PieceSize = S | MS | ML | L  
+data PieceSize = S | MS | ML | L
     deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
 $( agatath $ derive ''PieceSize)
 
-data Player = Black | White 
+data Player = Black | White
     deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
 $( agatath $ derive ''Player)
 
@@ -35,7 +35,6 @@ data Row = R0 | R1 | R2 | R3
 
 $( agatath $ derive ''Column)
 $( agatath $ derive ''Row)
-
 
 type Pos = (Column, Row)
 
@@ -59,19 +58,19 @@ data FrozenBoard = FrozenBoard
     }
 
 newtype BoardM a = BoardM (ReaderT (Board) IO a)
-    deriving (Monad, Functor)
+    deriving (Monad, Functor, MonadReader, MonadIO)
 
 mkBoard :: IO (BoardProper) -> IO (ReserveArray) -> IO (Board)
 mkBoard = liftM2 Board
 
 newBoard :: IO (Board)
-newBoard = mkBoard (makeMaxArray Nothing) (makeMaxArray (Just L)) 
+newBoard = mkBoard (makeMaxArray Nothing) (makeMaxArray (Just L))
    where
    makeMaxArray :: (Ix x, Bounded x) => e -> IO (IOArray x e)
    makeMaxArray fillValue = newArray fullBounds fillValue
 
 runBoardMOnNew :: BoardM a -> IO a
-runBoardMOnNew m = runBoardM m =<< newBoard 
+runBoardMOnNew m = runBoardM m =<< newBoard
 
 runBoardM :: BoardM a -> Board -> IO a
 runBoardM (BoardM m) arr = runReaderT m arr
@@ -87,7 +86,7 @@ runBoardMOnCopy m arr =
   runBoardM m (Board boardProperClone reservesClone)
 
 readArrayBM :: (Ix ix) => (Board -> IOArray ix e) -> ix -> BoardM e
-readArrayBM getArray x = 
+readArrayBM getArray x =
     do
     arr <- BoardM (asks getArray)
     BoardM (lift (readArray arr x))
@@ -118,35 +117,37 @@ saveArray getArray toChar =
     do
     arr <- BoardM (asks getArray)
     BoardM . lift $
-      forM fullRange 
+      forM fullRange
       (\ ix -> toChar `liftM` readArray arr ix)
 
 saveProperBoard :: BoardM String
 saveProperBoard = saveArray boardProper toChar
     where
     toChar :: Maybe Player -> Char
-    toChar Nothing = '-'
-    toChar (Just White) = 'W'
-    toChar (Just Black) = 'B'
+    toChar Nothing =  maybe playerToChar '-'
 
 saveReserveArray :: BoardM String
 saveReserveArray = saveArray reserveArray toChar
   where
   toChar :: Maybe PieceSize -> Char
-  toChar Nothing = '-'
-  toChar (Just S) = 'S'
-  toChar (Just MS) = 'm'
-  toChar (Just ML) = 'M'
-  toChar (Just L) = 'L'
-    
+  toChar = maybe pieceSizeToChar '-'
+
+playerToChar White = 'W'
+playerToChar Black = 'B'
+
+pieceSizeToChar S = 's'
+pieceSizeToChar MS = 'm'
+pieceSizeToChar ML = 'M'
+pieceSizeToChar L = 'L'
+
 saveBoard :: BoardM String
-saveBoard = liftM2 (++) saveProperBoard saveReserveArray 
+saveBoard = liftM2 (++) saveProperBoard saveReserveArray
 
 freezeBoardM :: BoardM FrozenBoard
 freezeBoardM = BoardM $
   do
   b <- ask
-  lift (freezeBoard b)  
+  lift (freezeBoard b)
 
 freezeBoard :: Board -> IO FrozenBoard
 freezeBoard (Board a b) = liftM2 FrozenBoard (freeze a) (freeze b)
@@ -157,10 +158,10 @@ thawBoard (FrozenBoard a b) = liftM2 Board (thaw a) (thaw b)
 mainBoard :: IO ExitCode
 mainBoard = return ExitSuccess
 
-data Move = Move {source :: Either PileID Pos, destination :: Pos} 
+data Move = Move {source :: Either PileID Pos, destination :: Pos}
 
 doMove :: Player -> Move -> EitherT MoveError BoardM ()
-doMove player move@(Move source destination) = 
+doMove player move@(Move source destination) =
   do
   movingPiece <- fmapLT (ReadSorceError move) (readSource player source)
   targetTop <- lift $ topPiece destination
@@ -168,7 +169,7 @@ doMove player move@(Move source destination) =
     case source of
       Left _ -> Nothing
       Right _ -> pred movingPiece
-  if targetTop > maxSize)
+  if targetTop > maxSize
     then throwError $
       if isFromReserves then MovesFromReservesCantGoble move targetTop else TargetToBigToGoble move maxSize targetTop
     else return ()
@@ -178,8 +179,8 @@ doMove player move@(Move source destination) =
     Right sourcePos -> lift $ removeTop sourcePos
   return ()
 
-data MoveError = ReadSourceError Move ReadSorceError 
-  | MovesFromReservesCantGoble Move (Maybe PieceSize) 
+data MoveError = ReadSourceError Move ReadSorceError
+  | MovesFromReservesCantGoble Move (Maybe PieceSize)
   | TargetTooBigToGoble (Maybe PieceSize) (Maybe PieceSize)
   deriving (Show)
 
@@ -188,7 +189,7 @@ data ReadSourceError = EmptySquare | EmptyPile | WrongColor
 readSource :: Player -> Either PileID Pos -> EitherT ReadSourceError BoardM ()
 readSource player source =
   case source of
-    Left pile -> noteAndHoist EmptyPile =<< (lift readReserveArray (player, pile))))
+    Left pile -> noteAndHoist EmptyPile =<< (lift readReserveArray (player, pile))
     Right source -> do
                     (player', size) <- hoistEither EmptySquare =<< lift (readTopSquare pos)
                     if player' != player
@@ -197,8 +198,16 @@ readSource player source =
 
   where
   noteAndHoist :: Monad m => e -> Maybe a -> EitherT e m a
-  noteAndHoist err = hoistEither . note err               
+  noteAndHoist err = hoistEither . note err
 
-readTopSquare = undefined
+readTopSquare :: Col -> Row -> BoardM (Maybe (PieceSize, Color))
+readTopSquare col row = takeFirst `fmap` action `mapM` fullRange
+  where
+  takeFirst :: [Maybe a] -> Maybe a
+  takeFirst = foldr takeLeft Nothing
+  takeLeft mx@(Just _) _ = mx
+  takeLeft Nothing my = my
 
+  action :: PieceSize -> BoardM (Maybe (PieceSize, Color))
+  action ps = fmap (ps,) <$> readBoardProper ((col, row), ps)
 
