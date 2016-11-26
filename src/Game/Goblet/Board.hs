@@ -1,4 +1,9 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables, TemplateHaskell #-}
+{-# LANGUAGE
+   GeneralizedNewtypeDeriving
+ , ScopedTypeVariables
+ , TemplateHaskell
+ , TupleSections
+   #-}
 module Game.Goblet.Board
   ( PieceSize (..), Player (..), Column (..), Pos
   , BoardProper, ReserveArray, Board (..)
@@ -9,32 +14,31 @@ module Game.Goblet.Board
   ) where
 import System.Exit
 
+import Prelude hiding (Enum(..))
 import Data.Array.IO hiding (unsafeFreeze)
 import Data.Array
 import Data.Array.Unsafe (unsafeFreeze)
 
 import Control.Monad
 import Control.Monad.Reader
-import Control.Monad.Maybe ()
+import Control.Monad.Except
 import Test.QuickCheck
-import Test.Agata
-import Prelude.SafeEnum
 
 data PieceSize = S | MS | ML | L
-    deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
-$( agatath $ derive ''PieceSize)
+    deriving (Eq, Ord, Read, Show, Ix, Bounded)
+
+nextSmaller S  = Nothing
+nextSmaller MS = Just S
+nextSmaller ML = Just MS
+nextSmaller L  = Just ML
 
 data Player = Black | White
-    deriving (Eq, Ord, Read, Show, Ix, Enum, Bounded)
-$( agatath $ derive ''Player)
+    deriving (Eq, Ord, Read, Show, Ix, Bounded)
 
 data Column = C0 | C1 | C2 | C3
-    deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
+    deriving (Eq, Ord, Read, Show, Ix, Bounded)
 data Row = R0 | R1 | R2 | R3
-    deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
-
-$( agatath $ derive ''Column)
-$( agatath $ derive ''Row)
+    deriving (Eq, Ord, Read, Show, Ix, Bounded)
 
 type Pos = (Column, Row)
 
@@ -42,8 +46,7 @@ type BoardProper = IOArray (Pos, PieceSize) (Maybe Player)
 type FrozenBoardProper = Array (Pos, PieceSize) (Maybe Player)
 
 data PileID = P0 | P1 | P2
-    deriving (Eq, Ord, Enum, Read, Show, Ix, Bounded)
-$( agatath $ derive ''Player)
+    deriving (Eq, Ord, Read, Show, Ix, Bounded)
 
 type ReserveArray = IOArray (Player, PileID) (Maybe PieceSize)
 type FrozenReserveArray = Array (Player, PileID) (Maybe PieceSize)
@@ -58,7 +61,7 @@ data FrozenBoard = FrozenBoard
     }
 
 newtype BoardM a = BoardM (ReaderT (Board) IO a)
-    deriving (Monad, Functor, MonadReader, MonadIO)
+    deriving (Monad, Functor, Applicative, MonadReader Board, MonadIO)
 
 mkBoard :: IO (BoardProper) -> IO (ReserveArray) -> IO (Board)
 mkBoard = liftM2 Board
@@ -160,54 +163,61 @@ mainBoard = return ExitSuccess
 
 data Move = Move {source :: Either PileID Pos, destination :: Pos}
 
-doMove :: Player -> Move -> EitherT MoveError BoardM ()
+instance Show Move where
+  show Move {source = s, destination = d}
+    = "(" : either show show s ++ ")->" ++ show d
+
+doMove :: Player -> Move -> ExceptT MoveError BoardM ()
 doMove player move@(Move source destination) =
   do
   movingPiece <- fmapLT (ReadSorceError move) (readSource player source)
   targetTop <- lift $ topPiece destination
-  (maxSize, isFromReserves) <-
-    case source of
-      Left _ -> Nothing
-      Right _ -> pred movingPiece
-  if targetTop > maxSize
-    then throwError $
-      if isFromReserves then MovesFromReservesCantGoble move targetTop else TargetToBigToGoble move maxSize targetTop
-    else return ()
-  writeProperBoard (Pos, movingPiece) (Just player)
+  checkTarget source movingPiece targetPiece
+  writeProperBoard (destination, movingPiece) (Just player)
   case source of
-    Left pile -> writeReservesArray (Player, pile) (pred movingPiece)
-    Right sourcePos -> lift $ removeTop sourcePos
+    Left pile -> writeReservesArray (Player, pile) (nextSmaller movingPiece)
+    Right sourcePos -> removeTop sourcePos
   return ()
 
-data MoveError = ReadSourceError Move ReadSorceError
-  | MovesFromReservesCantGoble Move (Maybe PieceSize)
-  | TargetTooBigToGoble (Maybe PieceSize) (Maybe PieceSize)
+checkTarget :: MonadError MoveError m => Either PileID Pos -> PieceSize -> m ()
+checkTarget _         _   Nothing     _ = return ()
+checkTarget (Left _)  _   (Just tPS)  move = throwError MovesFromReserveCantGoble move tPS
+checkTarget (Right _) mPS (Just tPS)  move =
+  if tPS >= mPS
+    then throwError TargetTooBigToGoble move mPS tPS
+    else return ()
+
+data MoveError
+  = ReadSourceError Move ReadSourceError
+  | MovesFromReservesCantGoble Move PieceSize
+  | TargetTooBigToGoble Move PieceSize PieceSize
   deriving (Show)
 
-data ReadSourceError = EmptySquare | EmptyPile | WrongColor
+data ReadSourceError = EmptySquare | EmptyPile | WrongPlayer
+  deriving (Show)
 
-readSource :: Player -> Either PileID Pos -> EitherT ReadSourceError BoardM ()
+readSource :: Player -> Either PileID Pos -> ExceptT ReadSourceError BoardM PieceSize
 readSource player source =
   case source of
-    Left pile -> noteAndHoist EmptyPile =<< (lift readReserveArray (player, pile))
-    Right source -> do
-                    (player', size) <- hoistEither EmptySquare =<< lift (readTopSquare pos)
-                    if player' != player
-                      then throwT WrongColor
-                      else return $ size
-
+    Left pile -> note EmptyPile =<< (lift readReserveArray (player, pile))
+    Right pos ->  do
+                  (size, player') <- note EmptySquare =<< lift (readTopSquare pos)
+                  if player' /= player
+                    then throwError WrongPlayer
+                    else return size
   where
-  noteAndHoist :: Monad m => e -> Maybe a -> EitherT e m a
-  noteAndHoist err = hoistEither . note err
+  note :: MonadError e m => e -> Maybe a -> m a
+  note err = maybe (throwError error) return
 
-readTopSquare :: Col -> Row -> BoardM (Maybe (PieceSize, Color))
-readTopSquare col row = takeFirst `fmap` action `mapM` fullRange
+
+readTopSquare :: Pos -> BoardM (Maybe (PieceSize, Player))
+readTopSquare (col,row) = takeFirst `liftM` (action `mapM` fullRange)
   where
   takeFirst :: [Maybe a] -> Maybe a
   takeFirst = foldr takeLeft Nothing
   takeLeft mx@(Just _) _ = mx
   takeLeft Nothing my = my
 
-  action :: PieceSize -> BoardM (Maybe (PieceSize, Color))
+  action :: PieceSize -> BoardM (Maybe (PieceSize, Player))
   action ps = fmap (ps,) <$> readBoardProper ((col, row), ps)
 
