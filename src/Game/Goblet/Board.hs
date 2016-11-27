@@ -3,13 +3,14 @@
  , ScopedTypeVariables
  , TemplateHaskell
  , TupleSections
-   #-}
+ , FlexibleContexts
+ #-}
 module Game.Goblet.Board
   ( PieceSize (..), Player (..), Column (..), Pos
   , BoardProper, ReserveArray, Board (..)
   , FrozenBoardProper, FrozenReserveArray, FrozenBoard (..)
   , BoardM (), newBoard, readBoardProper, writeBoardProper, readReserveArray, writeReserveArray
-  , fullBounds, fullRange, saveBoard, mainBoard
+  , fullBounds, fullRange, saveBoard
   , runBoardMOnNew, runBoardMOnCopy, freezeBoard, thawBoard, freezeBoardM
   ) where
 import System.Exit
@@ -24,9 +25,12 @@ import Control.Monad.Reader
 import Control.Monad.Except
 import Test.QuickCheck
 
+-- The Four sizes of piece, Small, MediumSmall, MediumLarge, Large
 data PieceSize = S | MS | ML | L
     deriving (Eq, Ord, Read, Show, Ix, Bounded)
 
+-- Used for the piles. Could use a list instead.
+nextSmaller :: PieceSize -> Maybe PieceSize
 nextSmaller S  = Nothing
 nextSmaller MS = Just S
 nextSmaller ML = Just MS
@@ -35,22 +39,29 @@ nextSmaller L  = Just ML
 data Player = Black | White
     deriving (Eq, Ord, Read, Show, Ix, Bounded)
 
+
 data Column = C0 | C1 | C2 | C3
     deriving (Eq, Ord, Read, Show, Ix, Bounded)
 data Row = R0 | R1 | R2 | R3
     deriving (Eq, Ord, Read, Show, Ix, Bounded)
-
 type Pos = (Column, Row)
+-- Together the piece and column give a square on the board.
 
+-- The BoardProper is just the played pieces, not counting the reserves
+-- In the X FrozenX pairs the frozen form is read only, the plain X is mutable.
+-- The distinction allows optimizations for the (eventual) AI.
 type BoardProper = IOArray (Pos, PieceSize) (Maybe Player)
 type FrozenBoardProper = Array (Pos, PieceSize) (Maybe Player)
 
+-- Each player starts the game with three stacks of pieces, that they can only use in largest to smallest order.
 data PileID = P0 | P1 | P2
     deriving (Eq, Ord, Read, Show, Ix, Bounded)
 
+-- Arguably this should be an unordered triplet, but that would be anoying visually, and to implement.
 type ReserveArray = IOArray (Player, PileID) (Maybe PieceSize)
 type FrozenReserveArray = Array (Player, PileID) (Maybe PieceSize)
 
+-- The entire game state. (-Not- including a undo stack)
 data Board = Board
     { boardProper :: BoardProper
     , reserveArray :: ReserveArray
@@ -60,53 +71,60 @@ data FrozenBoard = FrozenBoard
     , frozenReserveArray :: FrozenReserveArray
     }
 
+-- Just the IO monad with a implicit mutable board.
 newtype BoardM a = BoardM (ReaderT (Board) IO a)
     deriving (Monad, Functor, Applicative, MonadReader Board, MonadIO)
-
-mkBoard :: IO (BoardProper) -> IO (ReserveArray) -> IO (Board)
-mkBoard = liftM2 Board
 
 newBoard :: IO (Board)
 newBoard = mkBoard (makeMaxArray Nothing) (makeMaxArray (Just L))
    where
    makeMaxArray :: (Ix x, Bounded x) => e -> IO (IOArray x e)
    makeMaxArray fillValue = newArray fullBounds fillValue
+   mkBoard :: IO (BoardProper) -> IO (ReserveArray) -> IO (Board)
+   mkBoard = liftM2 Board
 
+-- run a BoardM action on a game start board.
 runBoardMOnNew :: BoardM a -> IO a
 runBoardMOnNew m = runBoardM m =<< newBoard
 
+-- run a BoardM action on the passed in (mutable) board
 runBoardM :: BoardM a -> Board -> IO a
 runBoardM (BoardM m) arr = runReaderT m arr
 
-clone :: forall ix e. (Ix ix) => IOArray ix e -> IO (IOArray ix e)
-clone a = thaw =<< (unsafeFreeze a :: IO (Array ix e))
 
+-- run a BoardM action on a mutable copy of the array passed in
 runBoardMOnCopy :: BoardM a -> Board -> IO a
 runBoardMOnCopy m arr =
   do
   boardProperClone <- clone (boardProper arr)
   reservesClone <- clone (reserveArray arr)
   runBoardM m (Board boardProperClone reservesClone)
+  where
+  clone :: forall ix e. (Ix ix) => IOArray ix e -> IO (IOArray ix e)
+  clone a = thaw =<< (freeze a :: IO (Array ix e))
 
-readArrayBM :: (Ix ix) => (Board -> IOArray ix e) -> ix -> BoardM e
+-- read from either of the implicit Board arrays
+readArrayBM :: (MonadReader Board m, MonadIO m, Ix ix) => (Board -> IOArray ix e) -> ix -> m e
 readArrayBM getArray x =
     do
-    arr <- BoardM (asks getArray)
-    BoardM (lift (readArray arr x))
+    arr <- reader getArray
+    liftIO (readArray arr x)
 
-writeArrayBM :: (Ix ix) => (Board -> IOArray ix e) -> ix -> e -> BoardM ()
+-- write from either of the implicit Board arrays
+writeArrayBM :: (MonadReader Board m, MonadIO m, Ix ix) => (Board -> IOArray ix e) -> ix -> e -> m ()
 writeArrayBM getArray x p =
     do
-    arr <- BoardM (asks getArray)
-    BoardM (lift (writeArray arr x p))
+    arr <- reader getArray
+    liftIO (writeArray arr x p)
 
-readBoardProper :: (Pos, PieceSize) -> BoardM (Maybe Player)
+-- Read and write to the individual arrays
+readBoardProper   :: (MonadReader Board m, MonadIO m) => (Pos, PieceSize)                    -> m (Maybe Player)
 readBoardProper = readArrayBM boardProper
-writeBoardProper :: (Pos, PieceSize) -> Maybe Player -> BoardM ()
+writeBoardProper  :: (MonadReader Board m, MonadIO m) => (Pos, PieceSize) -> Maybe Player    -> m ()
 writeBoardProper = writeArrayBM boardProper
-readReserveArray :: (Player, PileID) -> BoardM (Maybe PieceSize)
+readReserveArray  :: (MonadReader Board m, MonadIO m) => (Player, PileID)                    -> m (Maybe PieceSize)
 readReserveArray = readArrayBM reserveArray
-writeReserveArray :: (Player, PileID) -> Maybe PieceSize -> BoardM ()
+writeReserveArray :: (MonadReader Board m, MonadIO m) => (Player, PileID) -> Maybe PieceSize -> m ()
 writeReserveArray = writeArrayBM reserveArray
 
 fullBounds :: (Ix ix, Bounded ix) => (ix, ix)
@@ -125,71 +143,67 @@ saveArray getArray toChar =
 
 saveProperBoard :: BoardM String
 saveProperBoard = saveArray boardProper toChar
-    where
-    toChar :: Maybe Player -> Char
-    toChar Nothing =  maybe playerToChar '-'
+  where
+  toChar :: Maybe Player -> Char
+  toChar = maybe '-' playerToChar
+  playerToChar White = 'W'
+  playerToChar Black = 'B'
+
 
 saveReserveArray :: BoardM String
 saveReserveArray = saveArray reserveArray toChar
   where
   toChar :: Maybe PieceSize -> Char
-  toChar = maybe pieceSizeToChar '-'
-
-playerToChar White = 'W'
-playerToChar Black = 'B'
-
-pieceSizeToChar S = 's'
-pieceSizeToChar MS = 'm'
-pieceSizeToChar ML = 'M'
-pieceSizeToChar L = 'L'
+  toChar = maybe '-' pieceSizeToChar
+  pieceSizeToChar S = 's'
+  pieceSizeToChar MS = 'm'
+  pieceSizeToChar ML = 'M'
+  pieceSizeToChar L = 'L'
 
 saveBoard :: BoardM String
-saveBoard = liftM2 (++) saveProperBoard saveReserveArray
+saveBoard = (\ x y -> x ++ '\n' : y) <$> saveProperBoard <*> saveReserveArray
 
-freezeBoardM :: BoardM FrozenBoard
-freezeBoardM = BoardM $
-  do
-  b <- ask
-  lift (freezeBoard b)
+freezeBoardM :: (MonadReader Board m, MonadIO m) => m FrozenBoard
+freezeBoardM = freezeBoard =<< ask
 
-freezeBoard :: Board -> IO FrozenBoard
-freezeBoard (Board a b) = liftM2 FrozenBoard (freeze a) (freeze b)
+freezeBoard :: MonadIO m => Board -> m FrozenBoard
+freezeBoard (Board a b) = liftIO (FrozenBoard <$> (freeze a) <*> (freeze b))
 
-thawBoard :: FrozenBoard -> IO Board
-thawBoard (FrozenBoard a b) = liftM2 Board (thaw a) (thaw b)
+thawBoard :: MonadIO m => FrozenBoard -> m Board
+thawBoard (FrozenBoard a b) = liftIO (Board <$> (thaw a) <*> (thaw b))
 
-mainBoard :: IO ExitCode
-mainBoard = return ExitSuccess
+--Need to split move into pick up and put down.
 
 data Move = Move {source :: Either PileID Pos, destination :: Pos}
 
 instance Show Move where
   show Move {source = s, destination = d}
-    = "(" : either show show s ++ ")->" ++ show d
+    = '(' : either show show s ++ ")->" ++ show d
 
 doMove :: Player -> Move -> ExceptT MoveError BoardM ()
 doMove player move@(Move source destination) =
   do
-  movingPiece <- fmapLT (ReadSorceError move) (readSource player source)
-  targetTop <- lift $ topPiece destination
-  checkTarget source movingPiece targetPiece
-  writeProperBoard (destination, movingPiece) (Just player)
-  case source of
-    Left pile -> writeReservesArray (Player, pile) (nextSmaller movingPiece)
-    Right sourcePos -> removeTop sourcePos
-  return ()
+  movingPiece <- withExceptT (ReadSourceError move) (readSource player source)
+  targetTop   <- lift (readTopSquare destination)
+  _           <- withExceptT ($ move) (checkTarget source movingPiece (fst <$> targetTop))
+  writeBoardProper (destination, movingPiece) (Just player)
+  writeToSource source player movingPiece
 
-checkTarget :: MonadError MoveError m => Either PileID Pos -> PieceSize -> m ()
-checkTarget _         _   Nothing     _ = return ()
-checkTarget (Left _)  _   (Just tPS)  move = throwError MovesFromReserveCantGoble move tPS
-checkTarget (Right _) mPS (Just tPS)  move =
-  if tPS >= mPS
-    then throwError TargetTooBigToGoble move mPS tPS
-    else return ()
+writeToSource :: (MonadReader Board m, MonadIO m) => Either PileID Pos -> Player -> PieceSize -> m ()
+writeToSource (Left pile)       player  ps = writeReserveArray (player, pile)  (nextSmaller ps)
+writeToSource (Right sourcePos) _       ps = writeBoardProper  (sourcePos, ps) Nothing
+
+checkTarget :: MonadError (Move -> MoveError) m => Either PileID Pos -> PieceSize -> Maybe PieceSize -> m ()
+checkTarget _         _   Nothing     = return ()
+checkTarget (Left _)  _   (Just tPS)  = throwError (\ move -> MovesFromReserveCantGoble move tPS)
+checkTarget (Right _) mPS (Just tPS)  =
+  when
+    (tPS >= mPS)
+    (throwError $ \move -> TargetTooBigToGoble move mPS tPS)
 
 data MoveError
   = ReadSourceError Move ReadSourceError
-  | MovesFromReservesCantGoble Move PieceSize
+  | MovesFromReserveCantGoble Move PieceSize
   | TargetTooBigToGoble Move PieceSize PieceSize
   deriving (Show)
 
@@ -199,7 +213,7 @@ data ReadSourceError = EmptySquare | EmptyPile | WrongPlayer
 readSource :: Player -> Either PileID Pos -> ExceptT ReadSourceError BoardM PieceSize
 readSource player source =
   case source of
-    Left pile -> note EmptyPile =<< (lift readReserveArray (player, pile))
+    Left pile -> note EmptyPile =<< readReserveArray (player, pile)
     Right pos ->  do
                   (size, player') <- note EmptySquare =<< lift (readTopSquare pos)
                   if player' /= player
@@ -207,7 +221,7 @@ readSource player source =
                     else return size
   where
   note :: MonadError e m => e -> Maybe a -> m a
-  note err = maybe (throwError error) return
+  note err = maybe (throwError err) return
 
 
 readTopSquare :: Pos -> BoardM (Maybe (PieceSize, Player))
